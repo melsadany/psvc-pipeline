@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PSVC Task Recorder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 1rem;
+      background: #f5f5f5;
+    }
+    h1 {
+      color: #333;
+    }
+    .controls {
+      margin: 1.5rem 0;
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 0.75rem 1.5rem;
+      font-size: 1rem;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    #requestMic {
+      background: #2563eb;
+      color: white;
+    }
+    #requestMic:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+    #startTask {
+      background: #16a34a;
+      color: white;
+    }
+    #startTask:hover:not(:disabled) {
+      background: #15803d;
+    }
+    #status {
+      margin-top: 1rem;
+      padding: 1rem;
+      background: white;
+      border-left: 4px solid #2563eb;
+      font-size: 0.95rem;
+      color: #555;
+      border-radius: 4px;
+    }
+    #downloadLink {
+      display: none;
+      margin-top: 1.5rem;
+      padding: 0.75rem 1.5rem;
+      background: #059669;
+      color: white;
+      text-decoration: none;
+      border-radius: 4px;
+      display: inline-block;
+    }
+    #downloadLink:hover {
+      background: #047857;
+    }
+    video {
+      max-width: 100%;
+      width: 100%;
+      background: #000;
+      border-radius: 8px;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+  <h1>PSVC Task Recorder</h1>
+
+  <!-- Video player (source set in JS) -->
+  <video id="taskVideo" controls></video>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button id="requestMic">Enable microphone</button>
+    <button id="startTask" disabled>Start task</button>
+  </div>
+
+  <div id="status">Enable microphone to begin.</div>
+
+  <!-- Download link for recorded audio -->
+  <a id="downloadLink" href="#" download="participant_audio.mp3" style="display:none;">
+    Download recorded audio (MP3)
+  </a>
+
+  <!-- Load lamejs for MP3 encoding -->
+  <script src="lame.min.js"></script>
+  <!-- Or use CDN: -->
+  <!-- <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script> -->
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

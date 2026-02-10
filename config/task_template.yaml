@@ -1,0 +1,122 @@
+# Task configuration for PS-VC assessment
+task_name: "PS-VC"
+task_version: 2
+audio_format: "mp3"
+sample_rate: 44100
+bit_rate: 16
+
+# Task structure based on actual metadata
+tasks:
+  # Task 1: Word Association Test (WAT)
+  WAT:
+    task_num: 1
+    type: "semantic"
+    duration_sec: 12
+    prompts:
+      - {word: "fly", start_sec: 40, end_sec: 52}
+      - {word: "face", start_sec: 52, end_sec: 64}
+      - {word: "soft", start_sec: 64, end_sec: 76}
+      - {word: "voice", start_sec: 76, end_sec: 88}
+      - {word: "earth", start_sec: 88, end_sec: 100}
+      - {word: "miss", start_sec: 100, end_sec: 112}
+      - {word: "box", start_sec: 112, end_sec: 124}
+      - {word: "door", start_sec: 124, end_sec: 136}
+      - {word: "alone", start_sec: 136, end_sec: 148}
+      - {word: "good", start_sec: 148, end_sec: 159}
+      - {word: "street", start_sec: 159, end_sec: 171}
+      - {word: "corn", start_sec: 171, end_sec: 183}
+      - {word: "bed", start_sec: 183, end_sec: 195}
+      - {word: "hot", start_sec: 195, end_sec: 207}
+      - {word: "paper", start_sec: 207, end_sec: 219}
+      - {word: "number", start_sec: 219, end_sec: 231}
+      - {word: "garden", start_sec: 231, end_sec: 243}
+      - {word: "time", start_sec: 243, end_sec: 255}
+      - {word: "window", start_sec: 255, end_sec: 267}
+      - {word: "woman", start_sec: 267, end_sec: 279}
+  
+  # Task 2: Rapid Automatic Naming (RAN)
+  RAN:
+    task_num: 2
+    type: "rapid_naming"
+    prompts:
+      - {type: "5b5", block: 1, start_sec: 296, end_sec: 313}
+      - {type: "5b5", block: 2, start_sec: 314, end_sec: 331}
+      - {type: "6b6", block: 1, start_sec: 332, end_sec: 349}
+      - {type: "6b6", block: 2, start_sec: 350, end_sec: 366}
+  
+  # Task 3: Controlled Oral Word Association Test (COWAT)
+  COWAT:
+    task_num: 3
+    type: "phonemic"
+    duration_sec: 30
+    prompts:
+      - {letter: "S", start_sec: 380, end_sec: 412}
+      - {letter: "A", start_sec: 413, end_sec: 445}
+      - {letter: "C", start_sec: 446, end_sec: 478}
+      - {letter: "F", start_sec: 479, end_sec: 511}
+      - {letter: "L", start_sec: 512, end_sec: 543}
+  
+  # Task 4: Face Matching
+  Faces:
+    task_num: 4
+    type: "face_matching"
+    prompts:
+      - {block: 1, start_sec: 570, end_sec: 602}
+      - {block: 2, start_sec: 603, end_sec: 635}
+      - {block: 3, start_sec: 636, end_sec: 668}
+      - {block: 4, start_sec: 669, end_sec: 701}
+      - {block: 5, start_sec: 702, end_sec: 733}
+
+# Audio processing parameters
+audio_processing:
+  # No beep detection needed - we have exact timings
+  use_fixed_timings: true
+  
+  voice_activity:
+    frame_size_ms: 25
+    energy_threshold_percentile: 75
+
+# Transcription parameters
+transcription:
+  whisper_model: "large-v3"
+  language: "en"
+  device: "cpu"
+  confidence_threshold:
+    strict: 0.9
+    review: 0.8
+    auto: 0.0
+  
+  filters:
+    remove_fillers: ["uh", "um", "umm", "oh", "eh", "hmm", "hmmm", "mmm"]
+    remove_acknowledgments: ["yeah", "okay", "mhm"]
+    remove_punctuation: true
+    
+  # Task-specific settings
+  task_settings:
+    WAT:
+      transcribe: true
+      extract_features: true
+    RAN:
+      transcribe: true  # For duration calculation
+      extract_features: false  # Just timing
+    COWAT:
+      transcribe: true
+      extract_features: true
+    Faces:
+      transcribe: true  # No speech
+      extract_features: false
+
+# Feature extraction parameters
+features:
+  semantic_embeddings:
+    model: "text-embedding-bert"
+    cache_size: 50000
+    
+  phonetic_embeddings:
+    model: "PWE"
+    cache_size: 50000
+    
+  spatial_anchors:
+    visual: ["rotate", "pattern", "space", "shape", "design", "arrange", "symmetry", "grid", "angle", "dimension"]
+    spatial: ["above", "below", "left", "right", "inside", "outside", "between", "beside", "corner", "edge"]
+    reasoning: ["logic", "rule", "pattern", "sequence", "relation", "analogy", "correspond", "transform"]

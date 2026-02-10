@@ -1,0 +1,1253 @@
+################################################################################
+# Feature Extraction
+################################################################################
+
+################################################################################
+################################################################################
+# Part 1: Main orchestration + General/Temporal features + NEW FUNCTIONS
+################################################################################
+################################################################################
+
+################################################################################
+# Main Feature Extraction Function - UPDATED SIGNATURE
+################################################################################
+
+extract_all_features <- function(clean_transcription, 
+                                 participant_id,
+                                 acoustic_features = NULL,
+                                 embeddings,
+                                 archetype_refs,        # NEW
+                                 reference_data,
+                                 config,
+                                 rule_violations = NULL) {  # NEW
+  
+  tx <- clean_transcription
+  
+  # Only extract features for WAT and COWAT (not RAN or Faces)
+  tx_for_features <- tx %>%
+    dplyr::filter(task_type %in% c("WAT", "COWAT"))
+  
+  if (nrow(tx_for_features) == 0) {
+    log_warn("No transcriptions available for feature extraction")
+    return(NULL)
+  }
+  
+  # Split prompt vs response
+  tx_split <- tx_for_features %>%
+    mutate(
+      prompt = case_when(
+        task_type == "WAT" ~ word(prompt, 1),  # Just the word
+        task_type == "COWAT" ~ prompt,         # Letter
+        TRUE ~ prompt
+      ),
+      response = response  # Already cleaned
+    )
+  
+  log_info("Extracting features for {nrow(tx_split)} utterances")
+  
+  ################################################################################
+  # 1. GENERAL FEATURES
+  ################################################################################
+  
+  log_info("  Extracting general features...")
+  general_features <- extract_general_features(tx_split, reference_data)
+  
+  ################################################################################
+  # 2. TEMPORAL FEATURES (NOW INCLUDES BINS, PRODUCTIVITY, LAST RESPONSE GAP)
+  ################################################################################
+  
+  log_info("  Extracting temporal features...")
+  temporal_features <- extract_temporal_features(tx, reference_data)
+  
+  ################################################################################
+  # 3. SEMANTIC FEATURES
+  ################################################################################
+  
+  log_info("  Extracting semantic features...")
+  
+  # Check for novel words and extract embeddings
+  unique_words <- unique(c(tx_split$prompt, tx_split$response))
+  novel_semantic_words <- setdiff(unique_words, embeddings$semantic$text)
+  
+  if (length(novel_semantic_words) > 0) {
+    log_info("    Extracting semantic embeddings for {length(novel_semantic_words)} novel words...")
+    new_sem_emb <- extract_semantic_embeddings(novel_semantic_words)
+    embeddings$semantic <- rbind(embeddings$semantic, new_sem_emb)
+  }
+  
+  semantic_features <- extract_embedding_features(
+    tx_split,
+    embeddings$semantic,
+    archetype_refs$semantic,
+    prefix = "sem",
+    embedding_type = "semantic",
+    config
+  )
+  
+  ################################################################################
+  # 4. PHONETIC FEATURES
+  ################################################################################
+  
+  log_info("  Extracting phonetic features...")
+  
+  # Check for novel words in phonetic embeddings
+  novel_phonetic_words <- setdiff(unique_words, embeddings$phonetic$text)
+  
+  if (length(novel_phonetic_words) > 0) {
+    log_info("    Extracting phonetic embeddings for {length(novel_phonetic_words)} novel words...")
+    new_pwe_emb <- extract_phonetic_embeddings(novel_phonetic_words)
+    embeddings$phonetic <- rbind(embeddings$phonetic, 
+                                 new_pwe_emb %>% rename_at(.vars = vars(-text),.funs = function(x) paste0("Dim",as.numeric(x)+1)))%>%
+      distinct(text,.keep_all = T)
+  }
+  
+  phonetic_features <- extract_embedding_features(
+    tx_split,
+    embeddings$phonetic,
+    archetype_refs$phonetic,
+    prefix = "pho",
+    embedding_type = "phonetic",  # Important for dimension filtering!
+    config
+  )
+  
+  ################################################################################
+  # 5. COMBINE FEATURES
+  ################################################################################
+  
+  log_info("  Combining features...")
+  
+  # Per-prompt features (WAT has 20 prompts, COWAT has 5 letters)
+  per_prompt <- general_features$per_prompt %>%
+    full_join(temporal_features$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(semantic_features$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(phonetic_features$per_prompt, by = c("participant_id", "prompt"))
+  
+  # NEW: Add rule violations to per-prompt features
+  if (!is.null(rule_violations)) {
+    per_prompt <- per_prompt %>%
+      full_join(rule_violations$ums, by = c("participant_id", "prompt")) %>%
+      full_join(rule_violations$comments, by = c("participant_id", "prompt")) %>%
+      full_join(rule_violations$repeated_prompts, by = c("participant_id", "prompt")) %>%
+      full_join(rule_violations$repeated_words_per_prompt, by = c("participant_id", "prompt")) %>%
+      mutate(
+        ums_count = replace_na(ums_count, 0),
+        comment_count = replace_na(comment_count, 0),
+        rep_prompt = replace_na(rep_prompt, 0),
+        rep_words_per_prompt = replace_na(rep_words_per_prompt, 0),
+        # Composite error features
+        repetitions_errors = rep_prompt + rep_words_per_prompt,
+        offtopic_error = comment_count / (pmax(sentence_response, 1))
+      )
+  }
+  
+  # Per-task features (WAT vs COWAT)
+  per_task <- general_features$per_task %>%
+    full_join(temporal_features$per_task, by = c("participant_id", "task_type")) %>%
+    full_join(semantic_features$per_task, by = c("participant_id", "task_type")) %>%
+    full_join(phonetic_features$per_task, by = c("participant_id", "task_type"))
+  
+  # NEW: Add productivity slope to per-task
+  productivity <- extractProductivitySlope(tx) %>%
+    pivot_longer(cols = c(2,3),values_to = "productivity", names_to="task_type") %>%
+    mutate(task_type=sub("productivity_slope_","",task_type))
+  if (!is.null(productivity)) {
+    per_task <- per_task %>%
+      full_join(productivity, by = c("participant_id", "task_type"))
+  }
+  
+  # Per-participant features
+  per_participant <- general_features$per_participant %>%
+    full_join(temporal_features$per_participant, by = "participant_id") %>%
+    full_join(semantic_features$per_participant, by = "participant_id") %>%
+    full_join(phonetic_features$per_participant, by = "participant_id")
+  
+  # Add RAN durations if available
+  # ran_durations <- extract_ran_durations(tx %>% dplyr::filter(task_type == "RAN"))
+  # if (!is.null(ran_durations)) {
+  #   per_participant <- per_participant %>%
+  #     full_join(ran_durations, by = "participant_id")
+  # }
+  
+  # Add Faces durations if available
+  # faces_duration <- extract_faces_duration(tx %>% dplyr::filter(task_type == "Faces"))
+  # if (!is.null(faces_duration)) {
+  #   per_participant <- per_participant %>%
+  #     full_join(faces_duration, by = "participant_id")
+  # }
+  
+  log_info("  ✓ Feature extraction complete")
+  log_debug("    Per-prompt features: {ncol(per_prompt)} columns")
+  log_debug("    Per-task features: {ncol(per_task)} columns")
+  log_debug("    Per-participant features: {ncol(per_participant)} columns")
+  
+  return(list(
+    per_prompt = per_prompt,
+    per_task = per_task,
+    per_participant = per_participant
+  ))
+}
+
+################################################################################
+# Extract General Features
+################################################################################
+
+extract_general_features <- function(tx_split, reference_data) {
+  
+  # Lingmatch features
+  lingmatch_feat <- cbind(
+    response = unique(tx_split$response),
+    lingmatch::lma_meta(unique(tx_split$response)),
+    lingmatch::lma_termcat(unique(tx_split$response))
+  ) %>%
+    mutate_at(vars(25:33), ~ ifelse(. > 0, 1, 0)) %>%
+    mutate(sentence_response = ifelse(words > 1, 1, 0)) %>%
+    select(response, characters_per_word, syllables_per_word,
+           sentence_response, reading_grade, 25:33)
+  
+  # Sentiment features
+  sent_feat <- cbind(
+    response = unique(tx_split$response),
+    syuzhet::get_nrc_sentiment(unique(tx_split$response)),
+    sentimentr::profanity(unique(tx_split$response)) %>%
+      select(count_profanity = profanity_count)
+  ) %>%
+    mutate_at(vars(-response), ~ as.numeric(. > 0))
+  
+  # Join with reference data
+  tx_with_refs <- tx_split %>%
+    left_join(reference_data$aoa, by = c("response" = "word")) %>%
+    left_join(reference_data$gpt_familiarity, by = c("response" = "word")) %>%
+    left_join(reference_data$mrc, by = c("response" = "word")) %>%
+    left_join(reference_data$concreteness, by = c("response" = "word")) %>%
+    left_join(lingmatch_feat, by = "response") %>%
+    left_join(sent_feat, by = "response")
+  
+  # Aggregate per prompt
+  per_prompt <- tx_with_refs %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      unique_word_count = n_distinct(response),
+      mean_AoA = mean(AoA_Kup_lem, na.rm = TRUE),
+      mean_GPT_fam = mean(GPT_fam, na.rm = TRUE),
+      mean_concreteness = mean(concreteness, na.rm = TRUE),
+      mean_imageability = mean(imageability, na.rm = TRUE),
+      mean_phonemes = mean(number_of_phonemes, na.rm = TRUE),
+      characters_per_word = mean(characters_per_word, na.rm = TRUE),
+      syllables_per_word = mean(syllables_per_word, na.rm = TRUE),
+      reading_grade = mean(reading_grade, na.rm = TRUE),
+      sentence_response = mean(sentence_response, na.rm = TRUE),
+      across(starts_with("count_"), sum, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Aggregate per task
+  per_task <- tx_with_refs %>%
+    mutate(task_type = ifelse(nchar(prompt) == 1, "COWAT", "WAT")) %>%
+    group_by(participant_id, task_type) %>%
+    summarise(
+      unique_word_count = n_distinct(response),
+      mean_AoA = mean(AoA_Kup_lem, na.rm = TRUE),
+      mean_GPT_fam = mean(GPT_fam, na.rm = TRUE),
+      mean_concreteness = mean(concreteness, na.rm = TRUE),
+      mean_imageability = mean(imageability, na.rm = TRUE),
+      across(starts_with("count_"), sum, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Aggregate per participant
+  per_participant <- tx_with_refs %>%
+    group_by(participant_id) %>%
+    summarise(
+      unique_word_count = n_distinct(response),
+      mean_AoA = mean(AoA_Kup_lem, na.rm = TRUE),
+      mean_GPT_fam = mean(GPT_fam, na.rm = TRUE),
+      mean_concreteness = mean(concreteness, na.rm = TRUE),
+      across(starts_with("count_"), sum, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(list(
+    per_prompt = per_prompt,
+    per_task = per_task,
+    per_participant = per_participant
+  ))
+}
+
+################################################################################
+# NEW FUNCTION: Extract Bins Statistics
+################################################################################
+
+extractBinsStatistics <- function(tx) {
+  require(doMC)
+  require(ineq)
+  
+  registerDoMC(6)
+  
+  bins_stats <- foreach(id = 1:length(unique(tx$participant_id)), .combine = rbind) %dopar% {
+    id_n <- unique(tx$participant_id)[id]
+    
+    p_res <- foreach(p = 1:length(unique(tx$prompt[tx$participant_id == id_n])), .combine = rbind) %dopar% {
+      p_n <- unique(tx$prompt[tx$participant_id == id_n])[p]
+      df <- tx %>% dplyr::filter(participant_id == id_n, prompt == p_n)
+      
+      task_duration <- ifelse(nchar(p_n) == 1, 30, 12)  # COWAT=30s, WAT=12s
+      
+      if (nrow(df) > 1) {
+        # First/last half ratio
+        first_last_ratio <- sum(df$start < task_duration/2) / 
+          max(sum(df$start >= task_duration/2), 1)
+        
+        # K-S statistic for distribution
+        ks <- tryCatch({
+          as.numeric(ks.test(df$start, "punif", 0, task_duration, 
+                             alternative = "two.sided")$statistic)
+        }, error = function(e) NA_real_)
+        
+        # Gini index
+        gini_index <- tryCatch({
+          ineq::Gini(df$start)
+        }, error = function(e) NA_real_)
+        
+        # Bins slope
+        if (nrow(df) > 2) {
+          bins <- seq(0, task_duration, length.out = 7)  # 6 bins
+          df_binned <- df %>%
+            mutate(bin = cut(start, breaks = bins, labels = FALSE, include.lowest = TRUE)) %>%
+            mutate(bin = case_when(
+              start >= task_duration ~ 6,
+              is.na(bin) ~ 1,
+              TRUE ~ bin
+            ))
+          
+          bin_counts <- df_binned %>%
+            group_by(bin) %>%
+            summarise(counts = n(), .groups = "drop")
+          
+          bins_slope <- tryCatch({
+            summary(lm(counts ~ bin, data = bin_counts))$coef[2, 1]
+          }, error = function(e) NA_real_)
+        } else {
+          bins_slope <- NA_real_
+        }
+        
+        data.frame(
+          participant_id = id_n,
+          prompt = p_n,
+          halfs_ratio = first_last_ratio,
+          ks_statistic = ks,
+          Gini_index = gini_index,
+          bins_slope = bins_slope
+        )
+      } else {
+        return(NULL)
+      }
+    }
+    
+    return(p_res)
+  }
+  
+  return(bins_stats)
+}
+
+################################################################################
+# NEW FUNCTION: Extract Word Productivity Slope
+################################################################################
+
+extractProductivitySlope <- function(tx) {
+  
+  # Count words per prompt
+  word_count <- tx %>%
+    dplyr::filter(task_type %in% c("WAT", "COWAT")) %>%
+    distinct(participant_id, prompt, response) %>%
+    group_by(participant_id, prompt) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(task_type = ifelse(nchar(prompt) == 1, "COWAT", "WAT"))
+  
+  # Calculate productivity slopes
+  productivity <- word_count %>%
+    group_by(participant_id, task_type) %>%
+    arrange(prompt) %>%
+    mutate(prompt_num = row_number()) %>%
+    summarise(
+      productivity_slope = {
+        if (n() > 1) {
+          tryCatch({
+            summary(lm(count ~ prompt_num))$coef[2, 1]
+          }, error = function(e) NA_real_)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = task_type,
+      values_from = productivity_slope,
+      names_prefix = "productivity_slope_"
+    )
+  
+  return(productivity)
+}
+
+################################################################################
+# NEW FUNCTION: Extract Last Response Gap
+################################################################################
+
+extractLastResponseGap <- function(tx) {
+  
+  last_response <- tx %>%
+    dplyr::filter(task_type %in% c("WAT", "COWAT")) %>%
+    group_by(participant_id, prompt) %>%
+    slice_max(order_by = end, n = 1, with_ties = FALSE) %>%
+    mutate(
+      task_time = ifelse(nchar(prompt) == 1, 30, 12),  # COWAT=30s, WAT=12s
+      last_response_gap = end - task_time  # Can be negative
+    ) %>%
+    select(participant_id, prompt, last_response_gap)
+  
+  return(last_response)
+}
+
+################################################################################
+# Extract Temporal Features - UPDATED WITH NEW FUNCTIONS
+################################################################################
+
+extract_temporal_features <- function(tx, reference_data) {
+  
+  # Filter to WAT and COWAT only
+  tx_temporal <- tx %>%
+    dplyr::filter(task_type %in% c("WAT", "COWAT"))
+  
+  # Onset (response latency)
+  onset <- tx_temporal %>%
+    group_by(participant_id, prompt) %>%
+    slice_min(order_by = start, n = 1, with_ties = FALSE) %>%
+    select(participant_id, prompt, onset = start)
+  
+  # Thinking time (inter-word intervals)
+  thinking_time <- tx_temporal %>%
+    group_by(participant_id, prompt) %>%
+    dplyr::filter(n() > 1) %>%
+    arrange(participant_id, prompt, start) %>%
+    mutate(
+      thinking_time_e = start - lag(end),
+      thinking_time_s = start - lag(start),
+      thinking_time = ifelse(thinking_time_e < 0, thinking_time_s, thinking_time_e)
+    ) %>%
+    dplyr::filter(!is.na(thinking_time)) %>%
+    summarise(
+      thinking_time_mean = mean(thinking_time, na.rm = TRUE),
+      thinking_time_sd = sd(thinking_time, na.rm = TRUE),
+      thinking_time_min = min(thinking_time, na.rm = TRUE),
+      thinking_time_max = max(thinking_time, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Burst coefficient
+  burst <- tx_temporal %>%
+    group_by(participant_id, prompt) %>%
+    dplyr::filter(n() > 2) %>%
+    arrange(start) %>%
+    mutate(thinking_time = start - lag(start)) %>%
+    dplyr::filter(!is.na(thinking_time)) %>%
+    summarise(
+      burst_coefficient = (sd(thinking_time, na.rm = TRUE) - mean(thinking_time, na.rm = TRUE))/
+        (sd(thinking_time, na.rm = TRUE) + mean(thinking_time, na.rm = TRUE)),
+      .groups = "drop"
+    )
+  
+  # Insight patterns
+  insight <- tx_temporal %>%
+    group_by(participant_id, prompt) %>%
+    dplyr::filter(n() > 3) %>%
+    arrange(start) %>%
+    summarise(
+      insight_pattern_results = list(analyze_insight_patterns(start, response)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      insight_pattern_density = map_dbl(insight_pattern_results, ~ .[[1]]),
+      insight_pattern_count = map_dbl(insight_pattern_results, ~ .[[2]]),
+      pattern_regularity = map_dbl(insight_pattern_results, ~ .[[3]])
+    ) %>%
+    select(-insight_pattern_results)
+  
+  # NEW: Bins statistics
+  bins_stats <- extractBinsStatistics(tx_temporal)
+  
+  # NEW: Last response gap
+  last_response_gap <- extractLastResponseGap(tx_temporal)
+  
+  # Combine per-prompt
+  per_prompt <- onset %>%
+    full_join(thinking_time, by = c("participant_id", "prompt")) %>%
+    full_join(burst, by = c("participant_id", "prompt")) %>%
+    full_join(insight, by = c("participant_id", "prompt")) %>%
+    full_join(bins_stats, by = c("participant_id", "prompt")) %>%
+    full_join(last_response_gap, by = c("participant_id", "prompt"))
+  
+  # Aggregate per task
+  per_task <- per_prompt %>%
+    mutate(task_type = ifelse(nchar(prompt) == 1, "COWAT", "WAT")) %>%
+    group_by(participant_id, task_type) %>%
+    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+  
+  # Aggregate per participant
+  per_participant <- per_prompt %>%
+    group_by(participant_id) %>%
+    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+  
+  return(list(
+    per_prompt = per_prompt,
+    per_task = per_task,
+    per_participant = per_participant
+  ))
+}
+
+################################################################################
+# END OF PART 1
+################################################################################
+
+################################################################################
+################################################################################
+# Part 2: Embedding features + Archetype handling + Helper functions
+################################################################################
+################################################################################
+
+################################################################################
+# Extract Semantic Embeddings using sentence-transformers
+################################################################################
+extract_semantic_embeddings <- function(words) {
+  log_debug("Extracting semantic embeddings for {length(words)} words...")
+  
+  # Create temp files
+  temp_words_file <- tempfile(fileext = ".csv")
+  temp_output_file <- tempfile(fileext = ".csv")
+  
+  # Write words to CSV
+  write_csv(data.frame(word = words), temp_words_file)
+  
+  # Call semantic embeddings wrapper (runs in r_pipeline_env)
+  cmd <- paste(
+    "/opt/conda/envs/r_pipeline_env/bin/python",
+    "/app/scripts/semantic_embeddings_wrapper.py",
+    "--input", temp_words_file,
+    "--output", temp_output_file,
+    "--model", "all-MiniLM-L6-v2",  # 384-dim embeddings, fast
+    "--verbose"
+  )
+  
+  result <- system(cmd)
+  
+  if (result != 0 || !file.exists(temp_output_file)) {
+    log_error("Semantic embedding extraction failed")
+    return(NULL)
+  }
+  
+  # Read embeddings
+  embeddings <- read_csv(temp_output_file, show_col_types = FALSE)
+  
+  # Cleanup
+  unlink(c(temp_words_file, temp_output_file))
+  
+  # Rename 'word' to 'text' for consistency with pre-computed embeddings
+  embeddings <- embeddings %>% rename(text = word)
+  
+  return(embeddings)
+}
+
+################################################################################
+# Extract Phonetic Embeddings using PWESuite
+################################################################################
+extract_phonetic_embeddings <- function(words) {
+  log_debug("Extracting phonetic embeddings for {length(words)} words...")
+  
+  # Create temp files
+  temp_words_file <- tempfile(fileext = ".csv")
+  temp_output_file <- tempfile(fileext = ".csv")
+  
+  # Write words to CSV
+  write_csv(data.frame(word = words), temp_words_file)
+  
+  # Call PWE wrapper (runs in pwesuite_env)
+  cmd <- paste(
+    "/opt/conda/bin/conda run --no-capture-output -n pwesuite_env",
+    "python /app/scripts/pwe_wrapper.py",
+    "--input", temp_words_file,
+    "--output", temp_output_file,
+    "--model", "/app/reference_data/models/rnn_metric_learning_token_ort_all.pt",
+    "--verbose"
+  )
+  
+  result <- system(cmd)
+  
+  if (result != 0 || !file.exists(temp_output_file)) {
+    log_error("PWE extraction failed")
+    return(NULL)
+  }
+  
+  # Read embeddings
+  embeddings <- read_csv(temp_output_file, show_col_types = FALSE)
+  
+  # Cleanup
+  unlink(c(temp_words_file, temp_output_file))
+  
+  # Rename 'word' to 'text' for consistency
+  embeddings <- embeddings %>% rename(text = word)
+  
+  return(embeddings)
+}
+
+################################################################################
+# Extract Embedding-Based Features (works for BOTH semantic and phonetic)
+################################################################################
+
+extract_embedding_features <- function(tx_split, embeddings, archetype_ref,
+                                       prefix = "sem", embedding_type = "semantic",
+                                       config = NULL) {
+  
+  # Prepare embedding matrix for calculations
+  emb_matrix <- embeddings %>%
+    dplyr::filter(text %in% c(tx_split$prompt, tx_split$response)) %>%
+    column_to_rownames("text") %>%
+    as.matrix()
+  
+  # Similarity to prompts
+  sim_to_prompt <- tx_split %>%
+    distinct(participant_id, prompt, response) %>%
+    rowwise() %>%
+    mutate(
+      cosine_sim = cosine_similarity(
+        as.numeric(emb_matrix[prompt, ]),
+        as.numeric(emb_matrix[response, ])
+      )
+    ) %>%
+    group_by(participant_id, prompt) %>%
+    summarise(!!paste0(prefix, "_sim_to_prompt") := mean(cosine_sim, na.rm = TRUE),
+              .groups = "drop")
+  
+  # Pairwise similarity (consecutive and all pairs)
+  pairwise_sim <- calculate_pairwise_similarity(tx_split, emb_matrix, prefix)
+  
+  # Trajectory features (divergence, path length)
+  trajectory_features <- calculate_trajectory_features(tx_split, emb_matrix, prefix)
+  
+  # Vocabulary volume (convex hull in embedding space)
+  # vocab_volume <- calculate_vocabulary_volume(tx_split, emb_matrix, prefix)
+  
+  # Archetypal features (with novel word handling)
+  archetypal_result <- calculate_archetypal_features(
+    tx_split, embeddings, archetype_ref, prefix, embedding_type
+  )
+  
+  archetypal_features <- archetypal_result$per_prompt
+  arch_data <- archetypal_result$arch_data  # Get arch_data for other functions
+  
+  # Archetypal area (using arch_data from previous step)
+  archetypal_area <- calculate_archetypal_area(tx_split, arch_data, prefix)
+  
+  # Archetypal richness (using arch_data from previous step)
+  archetypal_richness <- calculate_archetypal_richness(tx_split, arch_data, prefix)
+  
+  # Norms (distance from origin)
+  norms <- calculate_norms(tx_split, emb_matrix, prefix)
+  
+  # Prompt similarity trajectory
+  prompt_sim_trajectory <- calculate_prompt_similarity_trajectory(tx_split, emb_matrix, prefix)
+  
+  # Combine per-prompt
+  per_prompt <- sim_to_prompt %>%
+    full_join(pairwise_sim$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(trajectory_features$per_prompt, by = c("participant_id", "prompt")) %>%
+    # full_join(vocab_volume$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(archetypal_features, by = c("participant_id", "prompt")) %>%
+    full_join(archetypal_area$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(archetypal_richness$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(norms$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(prompt_sim_trajectory, by = c("participant_id", "prompt"))
+  
+  # Aggregate per task
+  per_task <- per_prompt %>%
+    mutate(task_type = ifelse(nchar(prompt) == 1, "COWAT", "WAT")) %>%
+    group_by(participant_id, task_type) %>%
+    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+  
+  # Aggregate per participant
+  per_participant <- per_prompt %>%
+    group_by(participant_id) %>%
+    summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+    # full_join(vocab_volume$per_participant, by = "participant_id") %>%
+    full_join(archetypal_area$per_participant, by = "participant_id") %>%
+    full_join(archetypal_richness$per_participant, by = "participant_id") %>%
+    full_join(norms$per_participant, by = "participant_id")
+  
+  return(list(
+    per_prompt = per_prompt,
+    per_task = per_task,
+    per_participant = per_participant
+  ))
+}
+
+################################################################################
+# Get Archetype Assignments for Words (with novel word handling)
+################################################################################
+
+get_archetype_assignments <- function(words, embeddings, archetype_ref,
+                                      embedding_type = "semantic") {
+  
+  # Check which words are already in archetype references
+  known_words <- words[words %in% archetype_ref$assignments$text]
+  novel_words <- words[!words %in% archetype_ref$assignments$text]
+  
+  # Get assignments for known words
+  known_assignments <- archetype_ref$assignments %>%
+    dplyr::filter(text %in% known_words)
+  
+  # Predict assignments for novel words if any
+  if (length(novel_words) > 0) {
+    log_debug("      Predicting archetypes for {length(novel_words)} novel words...")
+    
+    # Get embeddings for novel words
+    novel_emb <- embeddings %>%
+      dplyr::filter(text %in% novel_words)
+    
+    if (nrow(novel_emb) > 0) {
+      # Extract embedding matrix
+      novel_emb_matrix <- novel_emb %>%
+        select(-text) %>%
+        as.matrix()
+      
+      # For phonetic: filter to same dimensions used in archetype model
+      if (embedding_type == "phonetic" && !is.null(archetype_ref$high_var_dims)) {
+        high_var_dims <- archetype_ref$high_var_dims
+        novel_emb_matrix <- novel_emb_matrix[, high_var_dims, drop = FALSE]
+      }
+      
+      # Load archetype model
+      arch <- archetype_ref$model
+      
+      # Predict archetype coefficients for novel words
+      novel_arch_coef <- tryCatch({
+        predict(arch, novel_emb_matrix)
+      }, error = function(e) {
+        log_warn("      Failed to predict archetypes: {e$message}")
+        return(NULL)
+      })
+      
+      if (!is.null(novel_arch_coef)) {
+        # Convert to weights data frame
+        novel_arch_weights <- as.data.frame(novel_arch_coef)
+        colnames(novel_arch_weights) <- paste0("A", 1:ncol(novel_arch_weights))
+        novel_arch_weights$text <- novel_emb$text
+        
+        # Assign to dominant archetype
+        novel_assignments <- novel_arch_weights %>%
+          pivot_longer(cols = starts_with("A"), names_to = "archetype", values_to = "weight") %>%
+          group_by(text) %>%
+          slice_max(order_by = weight, n = 1, with_ties = FALSE) %>%
+          select(text, archetype, weight)
+        
+        # Combine known and novel assignments
+        all_assignments <- bind_rows(known_assignments, novel_assignments)
+        
+        # Also return weights for richness calculation
+        all_weights <- bind_rows(
+          archetype_ref$weights %>% dplyr::filter(text %in% known_words),
+          novel_arch_weights
+        )
+        
+        # Predict simplex coordinates for novel words (for area calculation)
+        novel_simplex <- predict_simplex_coords(novel_arch_coef, arch, novel_emb$text)
+        all_simplex <- bind_rows(
+          archetype_ref$simplex %>% rename(text=word) %>% dplyr::filter(text %in% known_words),
+          novel_simplex
+        )
+      } else {
+        # Prediction failed
+        all_assignments <- known_assignments
+        all_weights <- archetype_ref$weights %>% dplyr::filter(text %in% known_words)
+        all_simplex <- archetype_ref$simplex %>% dplyr::filter(text %in% known_words)
+      }
+    } else {
+      # Novel words not in embeddings either
+      all_assignments <- known_assignments
+      all_weights <- archetype_ref$weights %>% dplyr::filter(text %in% known_words)
+      all_simplex <- archetype_ref$simplex %>% dplyr::filter(text %in% known_words)
+    }
+  } else {
+    # All words are known
+    all_assignments <- known_assignments
+    all_weights <- archetype_ref$weights %>% dplyr::filter(text %in% known_words)
+    all_simplex <- archetype_ref$simplex %>% dplyr::filter(text %in% known_words)
+  }
+  
+  return(list(
+    assignments = all_assignments,
+    weights = all_weights,
+    simplex = all_simplex
+  ))
+}
+
+################################################################################
+# Helper: Predict Simplex Coordinates for Novel Words
+################################################################################
+
+predict_simplex_coords <- function(arch_coef, arch_model, word_labels) {
+  # Get the simplex projection (2D coordinates from archetype weights)
+  # Use first 2 archetype dimensions for 2D projection
+  k <- ncol(arch_coef)
+  
+  if (k >= 2) {
+    # Simple approach: use first 2 dimensions
+    simplex_coords <- data.frame(
+      text = word_labels,
+      x = arch_coef[, 1],
+      y = arch_coef[, 2]
+    )
+  } else {
+    # Only 1 archetype dimension
+    simplex_coords <- data.frame(
+      text = word_labels,
+      x = arch_coef[, 1],
+      y = 0
+    )
+  }
+  
+  return(simplex_coords)
+}
+
+################################################################################
+# Calculate Archetypal Features - UPDATED with novel word handling
+################################################################################
+
+calculate_archetypal_features <- function(tx_split, embeddings, archetype_ref,
+                                          prefix = "sem", embedding_type = "semantic") {
+  
+  # Get all words (prompts + responses)
+  all_words <- unique(c(tx_split$prompt, tx_split$response))
+  
+  # Get archetype assignments (handling novel words)
+  arch_data <- get_archetype_assignments(
+    words = all_words,
+    embeddings = embeddings,
+    archetype_ref = archetype_ref,
+    embedding_type = embedding_type
+  )
+  
+  # Join with transcription data
+  tx_with_arch <- tx_split %>%
+    left_join(arch_data$assignments, by = c("response" = "text"))
+  
+  # Calculate metrics per prompt
+  archetypal_valid_data <- tx_with_arch %>%
+    dplyr::filter(!is.na(archetype))
+  archetypal_lifetimes <- archetypal_valid_data %>%
+    group_by(participant_id,prompt,archetype) %>%
+    summarise(lifetime = sum(end - start, na.rm = TRUE), .groups = "drop") %>%
+    group_by(participant_id,prompt) %>% summarise(!!paste0(prefix, "_community_lifetime") := mean(lifetime), .groups = "drop")
+  archetypal_switches <- archetypal_valid_data %>%
+    group_by(participant_id,prompt) %>%
+    summarise(!!paste0(prefix, "_community_switches") := sum(archetype != lag(archetype), na.rm = TRUE))
+  
+  archetypal_count <- archetypal_valid_data %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      # Number of unique archetypes visited
+      !!paste0(prefix, "_communities") := length(unique(archetype[!is.na(archetype)])),
+      .groups = "drop"
+    )
+  archetypal <- full_join(archetypal_count, archetypal_lifetimes) %>% full_join(archetypal_switches)
+  
+  return(list(
+    per_prompt = archetypal,
+    arch_data = arch_data  # Return for use in other functions
+  ))
+}
+
+################################################################################
+# Calculate Archetypal Richness - UPDATED with novel word handling
+################################################################################
+
+calculate_archetypal_richness <- function(tx_split, arch_data, prefix = "sem") {
+  
+  # Per prompt richness
+  per_prompt_rich <- tx_split %>%
+    distinct(participant_id, prompt, response) %>%
+    left_join(arch_data$weights, by = c("response" = "text")) %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      !!paste0(prefix, "_archetypal_richness") := {
+        # Sum of max weights across all archetypes for words in this prompt
+        weights_subset <- cur_data() %>%
+          select(starts_with("A"))
+        if (ncol(weights_subset) > 0 && nrow(weights_subset) > 0) {
+          sum(apply(weights_subset, 2, max, na.rm = TRUE), na.rm = TRUE)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  # Per participant richness
+  per_participant_rich <- tx_split %>%
+    distinct(participant_id, response) %>%
+    left_join(arch_data$weights, by = c("response" = "text")) %>%
+    group_by(participant_id) %>%
+    summarise(
+      !!paste0(prefix, "_archetypal_richness") := {
+        weights_subset <- cur_data() %>%
+          select(starts_with("A"))
+        if (ncol(weights_subset) > 0 && nrow(weights_subset) > 0) {
+          sum(apply(weights_subset, 2, max, na.rm = TRUE), na.rm = TRUE)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  return(list(
+    per_prompt = per_prompt_rich,
+    per_participant = per_participant_rich
+  ))
+}
+
+################################################################################
+# Calculate Archetypal Area - UPDATED with novel word handling
+################################################################################
+
+calculate_archetypal_area <- function(tx_split, arch_data, prefix = "sem") {
+  require(geometry)
+  
+  # Per prompt area
+  per_prompt_area <- tx_split %>%
+    distinct(participant_id, prompt, response) %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      !!paste0(prefix, "_archetypal_area") := {
+        words_in_prompt <- unique(response)
+        if (length(words_in_prompt) >= 3) {
+          # Get simplex coordinates for these words
+          coords <- arch_data$simplex %>%
+            dplyr::filter(text %in% words_in_prompt) %>%
+            select(x, y)
+          
+          if (nrow(coords) >= 3) {
+            tryCatch({
+              convhulln(as.matrix(coords), output.options = TRUE)$vol
+            }, error = function(e) NA_real_)
+          } else {
+            NA_real_
+          }
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  # Per participant area
+  per_participant_area <- tx_split %>%
+    distinct(participant_id, response) %>%
+    group_by(participant_id) %>%
+    summarise(
+      !!paste0(prefix, "_archetypal_area") := {
+        all_words <- unique(response)
+        if (length(all_words) >= 3) {
+          coords <- arch_data$simplex %>%
+            dplyr::filter(text %in% all_words) %>%
+            select(x, y)
+          
+          if (nrow(coords) >= 3) {
+            tryCatch({
+              convhulln(as.matrix(coords), output.options = TRUE)$vol
+            }, error = function(e) NA_real_)
+          } else {
+            NA_real_
+          }
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  return(list(
+    per_prompt = per_prompt_area,
+    per_participant = per_participant_area
+  ))
+}
+################################################################################
+# END OF PART 2
+################################################################################
+
+
+################################################################################
+################################################################################
+# Part 3: Helper functions for embedding-based features
+################################################################################
+################################################################################
+
+################################################################################
+# Calculate Pairwise Similarity
+################################################################################
+
+calculate_pairwise_similarity <- function(tx_split, emb_matrix, prefix = "sem") {
+  
+  # Consecutive pairs
+  consecutive_sim <- tx_split %>%
+    arrange(participant_id, prompt, start) %>%
+    group_by(participant_id, prompt) %>%
+    mutate(
+      cosine_sim = {
+        if (n() > 1) {
+          sims <- sapply(2:n(), function(i) {
+            cosine_similarity(
+              as.numeric(emb_matrix[response[i-1], ]),
+              as.numeric(emb_matrix[response[i], ])
+            )
+          })
+          c(NA_real_, sims)
+        } else {
+          NA_real_
+        }
+      }
+    ) %>%
+    summarise(
+      !!paste0(prefix, "_consecutive_sim_mean") := mean(cosine_sim, na.rm = TRUE),
+      !!paste0(prefix, "_consecutive_sim_sd") := sd(cosine_sim, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # All pairs
+  all_pairs_sim <- tx_split %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      !!paste0(prefix, "_all_pairs_sim_mean") := {
+        words <- unique(response)
+        if (length(words) > 1) {
+          pairs <- combn(words, 2)
+          sims <- apply(pairs, 2, function(pair) {
+            cosine_similarity(
+              as.numeric(emb_matrix[pair[1], ]),
+              as.numeric(emb_matrix[pair[2], ])
+            )
+          })
+          mean(sims, na.rm = TRUE)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  per_prompt <- consecutive_sim %>%
+    full_join(all_pairs_sim, by = c("participant_id", "prompt"))
+  
+  return(list(per_prompt = per_prompt))
+}
+
+################################################################################
+# Calculate Trajectory Features
+################################################################################
+
+calculate_trajectory_features <- function(tx_split, emb_matrix, prefix = "sem") {
+  require(TSP)
+  
+  trajectory <- tx_split %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      # Cumulative Euclidean distance
+      !!paste0(prefix, "_path_length") := {
+        words <- unique(response)
+        if (length(words) > 1) {
+          dists <- sapply(2:length(words), function(i) {
+            sqrt(sum((emb_matrix[words[i], ] - emb_matrix[words[i-1], ])^2))
+          })
+          sum(dists, na.rm = TRUE)
+        } else {
+          0
+        }
+      },
+      
+      # TSP divergence (ordered vs optimal path)
+      !!paste0(prefix, "_divergence") := {
+        words <- unique(response)
+        if (length(words) > 3) {
+          # Calculate distance matrix
+          dist_matrix <- dist(emb_matrix[words, ])
+          
+          # Ordered path length (chronological)
+          ordered_path <- sum(sapply(2:length(words), function(i) {
+            as.matrix(dist_matrix)[i, i-1]
+          }))
+          
+          # Optimal path (TSP solution)
+          tryCatch({
+            tsp_obj <- TSP(dist_matrix)
+            tour <- solve_TSP(tsp_obj)
+            optimal_path <- tour_length(tour)
+            
+            # Divergence = ordered - optimal
+            ordered_path - optimal_path
+          }, error = function(e) {
+            NA_real_
+          })
+        } else {
+          NA_real_
+        }
+      },
+      
+      .groups = "drop"
+    )
+  
+  return(list(per_prompt = trajectory))
+}
+
+################################################################################
+# Calculate Vocabulary Volume
+################################################################################
+
+calculate_vocabulary_volume <- function(tx_split, emb_matrix, prefix = "sem") {
+  require(geometry)
+  
+  # Per prompt volume
+  per_prompt_vol <- tx_split %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      !!paste0(prefix, "_vocab_volume") := {
+        words <- unique(response)
+        if (length(words) >= 3) {
+          tryCatch({
+            convhulln(emb_matrix[words, ], output.options = TRUE)$vol
+          }, error = function(e) NA_real_)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  # Per participant volume (all responses across all prompts)
+  per_participant_vol <- tx_split %>%
+    group_by(participant_id) %>%
+    summarise(
+      !!paste0(prefix, "_vocab_volume") := {
+        all_words <- unique(response)
+        if (length(all_words) >= 3) {
+          tryCatch({
+            convhulln(emb_matrix[all_words, ], output.options = TRUE)$vol
+          }, error = function(e) NA_real_)
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+  
+  return(list(
+    per_prompt = per_prompt_vol,
+    per_participant = per_participant_vol
+  ))
+}
+
+################################################################################
+# Calculate Norms (Distance from origin)
+################################################################################
+
+calculate_norms <- function(tx_split, emb_matrix, prefix = "sem") {
+  
+  # Calculate L2 norm for each word
+  word_norms <- rowSums(emb_matrix^2)^0.5
+  
+  # Per prompt norms
+  per_prompt_norms <- tx_split %>%
+    mutate(norm = word_norms[response]) %>%
+    group_by(participant_id, prompt) %>%
+    summarise(
+      !!paste0(prefix, "_norm_mean") := mean(norm, na.rm = TRUE),
+      !!paste0(prefix, "_norm_sd") := sd(norm, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Per participant norms
+  per_participant_norms <- tx_split %>%
+    mutate(norm = word_norms[response]) %>%
+    group_by(participant_id) %>%
+    summarise(
+      !!paste0(prefix, "_norm_mean") := mean(norm, na.rm = TRUE),
+      !!paste0(prefix, "_norm_sd") := sd(norm, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  return(list(
+    per_prompt = per_prompt_norms,
+    per_participant = per_participant_norms
+  ))
+}
+
+################################################################################
+# Calculate Prompt Similarity Trajectory
+################################################################################
+
+calculate_prompt_similarity_trajectory <- function(tx_split, emb_matrix, prefix = "sem") {
+  
+  in_data <- tx_split %>%
+    arrange(participant_id, prompt, start) %>%
+    rowwise() %>%
+    mutate(
+      sim_to_prompt_current = cosine_similarity(
+        as.numeric(emb_matrix[prompt, ]),
+        as.numeric(emb_matrix[response, ])
+      )
+    ) %>% ungroup()
+  
+  prompt_sim_traj_slope <- in_data %>% group_by(participant_id,prompt) %>%
+    summarise(!!paste0(prefix, "_sim_to_prompt_slope") := {
+      if (n() > 1) {
+        time_seq <- start - min(start)
+        lm_result <- lm(sim_to_prompt_current ~ time_seq)
+        coef(lm_result)[2]
+      } else {
+        NA_real_
+      }
+    }) %>% ungroup()
+    
+  prompt_sim_traj <- in_data %>% group_by(participant_id,prompt) %>%
+    summarise(
+      # Initial similarity (first response to prompt)
+      !!paste0(prefix, "_sim_to_prompt_initial") := first(sim_to_prompt_current),
+      
+      # Final similarity (last response to prompt)
+      !!paste0(prefix, "_sim_to_prompt_final") := last(sim_to_prompt_current),
+      
+      # Change in similarity (final - initial)
+      !!paste0(prefix, "_sim_to_prompt_delta") := last(sim_to_prompt_current) - first(sim_to_prompt_current)
+    )
+  
+  prompt_sim_traj_all <- full_join(prompt_sim_traj,prompt_sim_traj_slope)
+  
+  return(prompt_sim_traj_all)
+}
+
+################################################################################
+# Utility: Cosine Similarity
+################################################################################
+
+cosine_similarity <- function(vec1, vec2) {
+  if (all(is.na(vec1)) || all(is.na(vec2))) return(NA_real_)
+  if (length(vec1) != length(vec2)) return(NA_real_)
+  
+  dot_product <- sum(vec1 * vec2, na.rm = TRUE)
+  norm1 <- sqrt(sum(vec1^2, na.rm = TRUE))
+  norm2 <- sqrt(sum(vec2^2, na.rm = TRUE))
+  
+  if (norm1 == 0 || norm2 == 0) return(0)
+  
+  return(dot_product / (norm1 * norm2))
+}
+
+################################################################################
+# END OF PART 3
+################################################################################
