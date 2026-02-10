@@ -2,9 +2,9 @@
 FROM ubuntu:22.04
 
 LABEL maintainer="melsadany24@gmail.com"
-LABEL description="ISS Audio Processing Pipeline with WhisperX, PWESuite, and R"
+LABEL description="PSVC Audio Processing Pipeline with WhisperX, PWESuite, and R"
 LABEL version="1.0"
-LABEL org.opencontainers.image.source="https://github.com/melsadany/iss-pipeline"
+LABEL org.opencontainers.image.source="https://github.com/melsadany/psvc-pipeline"
 
 
 # Set environment to avoid interactive prompts
