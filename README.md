@@ -97,7 +97,7 @@ All dependencies are containerized. You only need:
 ### 1. Clone the Repository
 
 ```bash
-git clone YOUR_GITHUB_URL_HERE
+git clone https://github.com/melsadany/psvc-pipeline
 cd psvc-pipeline
 ```
 
@@ -452,7 +452,7 @@ docker run --rm -it \
 
 ```bash
 # Clone repository
-git clone YOUR_GITHUB_URL_HERE
+git clone https://github.com/melsadany/psvc-pipeline
 cd psvc-pipeline
 
 # Build with development tag
@@ -513,10 +513,10 @@ If you use this pipeline in your research, please cite:
 
 ```bibtex
 @software{psvc_pipeline_2026,
-  author = {[Your Name]},
+  author = {Muhammad Elsadany},
   title = {PSVC Audio Processing Pipeline},
   year = {2026},
-  url = {YOUR_GITHUB_URL_HERE},
+  url = {https://github.com/melsadany/psvc-pipeline},
   version = {1.0}
 }
 ```
@@ -534,7 +534,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Contact
 
-- **Maintainer**: [Your Name] (melsadany24@gmail.com)
+- **Maintainer**: Muhammad Elsadany (melsadany24@gmail.com)
 - **Institution**: University of Iowa, Department of Psychiatry
 - **Issues**: GitHub Issues page for your repository
 
