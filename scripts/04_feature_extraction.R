@@ -67,11 +67,13 @@ extract_all_features <- function(clean_transcription,
   
   # Check for novel words and extract embeddings
   unique_words <- unique(c(tx_split$prompt, tx_split$response))
-  novel_semantic_words <- setdiff(unique_words, embeddings$semantic$text)
+  novel_semantic_words <- setdiff(unique_words, embeddings$semantic$word)
+  embeddings$semantic <- embeddings$semantic %>% dplyr::rename(text=word)
   
   if (length(novel_semantic_words) > 0) {
     log_info("    Extracting semantic embeddings for {length(novel_semantic_words)} novel words...")
-    new_sem_emb <- extract_semantic_embeddings(novel_semantic_words)
+    new_sem_emb <- extract_semantic_embeddings(novel_semantic_words) %>%
+      rename_at(.vars = vars(-c(text)), .funs = function(x)paste0("X",x))
     embeddings$semantic <- rbind(embeddings$semantic, new_sem_emb)
   }
   
@@ -83,6 +85,10 @@ extract_all_features <- function(clean_transcription,
     embedding_type = "semantic",
     config
   )
+  
+  anchors_features <- calculate_anchor_set_similarity(tx_split, 
+                                                      embeddings$semantic %>% as.data.frame() %>% column_to_rownames("text"),
+                                                      prefix = "sem", config)
   
   ################################################################################
   # 4. PHONETIC FEATURES
@@ -120,6 +126,7 @@ extract_all_features <- function(clean_transcription,
   per_prompt <- general_features$per_prompt %>%
     full_join(temporal_features$per_prompt, by = c("participant_id", "prompt")) %>%
     full_join(semantic_features$per_prompt, by = c("participant_id", "prompt")) %>%
+    full_join(anchors_features, by = c("participant_id", "prompt")) %>%
     full_join(phonetic_features$per_prompt, by = c("participant_id", "prompt"))
   
   # NEW: Add rule violations to per-prompt features
@@ -140,10 +147,19 @@ extract_all_features <- function(clean_transcription,
       )
   }
   
+  
+  task_mapping <- rbind(map_df(config$tasks$WAT$prompts, function(x) x) %>% 
+                          select(prompt=1) %>% mutate(task_type="WAT"),
+                        map_df(config$tasks$COWAT$prompts, function(x) x) %>% 
+                          select(prompt=1) %>% mutate(prompt=tolower(prompt),task_type="COWAT"))
+  
   # Per-task features (WAT vs COWAT)
   per_task <- general_features$per_task %>%
     full_join(temporal_features$per_task, by = c("participant_id", "task_type")) %>%
     full_join(semantic_features$per_task, by = c("participant_id", "task_type")) %>%
+    full_join(anchors_features %>% left_join(task_mapping) %>%
+                dplyr::select(-prompt) %>% group_by(participant_id,task_type) %>% 
+                summarise_all(max) %>% ungroup(), by = c("participant_id", "task_type")) %>%
     full_join(phonetic_features$per_task, by = c("participant_id", "task_type"))
   
   # NEW: Add productivity slope to per-task
@@ -159,6 +175,9 @@ extract_all_features <- function(clean_transcription,
   per_participant <- general_features$per_participant %>%
     full_join(temporal_features$per_participant, by = "participant_id") %>%
     full_join(semantic_features$per_participant, by = "participant_id") %>%
+    full_join(anchors_features %>% left_join(task_mapping) %>%
+                dplyr::select(-prompt) %>% group_by(participant_id) %>% 
+                summarise_all(max) %>% ungroup(), by = c("participant_id")) %>%
     full_join(phonetic_features$per_participant, by = "participant_id")
   
   # Add RAN durations if available
@@ -607,7 +626,7 @@ extract_embedding_features <- function(tx_split, embeddings, archetype_ref,
                                        config = NULL) {
   
   # Prepare embedding matrix for calculations
-  emb_matrix <- embeddings %>%
+  emb_matrix <- embeddings %>% as.data.frame() %>%
     dplyr::filter(text %in% c(tx_split$prompt, tx_split$response)) %>%
     column_to_rownames("text") %>%
     as.matrix()
@@ -650,10 +669,20 @@ extract_embedding_features <- function(tx_split, embeddings, archetype_ref,
   archetypal_richness <- calculate_archetypal_richness(tx_split, arch_data, prefix)
   
   # Norms (distance from origin)
-  norms <- calculate_norms(tx_split, emb_matrix, prefix)
+  norms <- calculate_norms(tx_split, embeddings %>%
+                             dplyr::filter(text %in% c("a", "the", tx_split$response)) %>%
+                             column_to_rownames("text") %>%
+                             as.matrix(), prefix)
   
   # Prompt similarity trajectory
   prompt_sim_trajectory <- calculate_prompt_similarity_trajectory(tx_split, emb_matrix, prefix)
+  
+  
+  # anchors similarity
+  if (prefix=="sem") {
+    
+  }
+  
   
   # Combine per-prompt
   per_prompt <- sim_to_prompt %>%
@@ -673,7 +702,7 @@ extract_embedding_features <- function(tx_split, embeddings, archetype_ref,
     summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
   
   # Aggregate per participant
-  per_participant <- per_prompt %>%
+  per_participant <- per_prompt %>% dplyr::select(-colnames(norms$per_prompt)[-c(1:2)]) %>%
     group_by(participant_id) %>%
     summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
     # full_join(vocab_volume$per_participant, by = "participant_id") %>%
@@ -1158,26 +1187,119 @@ calculate_vocabulary_volume <- function(tx_split, emb_matrix, prefix = "sem") {
 
 calculate_norms <- function(tx_split, emb_matrix, prefix = "sem") {
   
-  # Calculate L2 norm for each word
-  word_norms <- rowSums(emb_matrix^2)^0.5
+  # per-word norms (raw and origin-centered)
+  l1_raw <- rowSums(emb_matrix)
+  l2_raw <- sqrt(rowSums(emb_matrix^2))
   
-  # Per prompt norms
+  # origin = average of all emb_matrix
+  mean_all <- colMeans(emb_matrix)
+  emb_center_all <- sweep(emb_matrix, 2, mean_all, "-")
+  l1_origin_all <- rowSums(emb_center_all)
+  l2_origin_all <- sqrt(rowSums(emb_center_all^2))
+  
+  # origin = average of a small set (e.g., "a", "the")
+  origin_set_words <- c("a", "the")
+  has_origin_set <- all(origin_set_words %in% rownames(emb_matrix))
+  
+  if (has_origin_set) {
+    mean_set <- colMeans(emb_matrix[origin_set_words,])
+    emb_center_set <- sweep(emb_matrix, 2, mean_set, "-")
+    l1_origin_set <- rowSums(emb_center_set)
+    l2_origin_set <- sqrt(rowSums(emb_center_set^2))
+  } else {
+    # if origin is not avaialble, fall bacj to NA
+    l1_origin_set <- rep(NA_real_, nrow(emb_matrix))
+    l2_origin_set <- rep(NA_real_, nrow(emb_matrix))
+  }
+  
+  ## collect norms in a data.frame keyed by word
+  norms_df <- data.frame(
+    response = rownames(emb_matrix),
+    l1_norm = l1_raw,
+    l2_norm = l2_raw,
+    l1_norm_origin_avg_all = l1_origin_all,
+    l2_norm_origin_avg_all = l2_origin_all,
+    l1_norm_origin_avg_set = l1_origin_set,
+    l2_norm_origin_avg_set = l2_origin_set,
+    stringsAsFactors = FALSE
+  )
+  
+  
+  # --- Per-prompt summaries (mean/sd for each norm type) ---
+  
   per_prompt_norms <- tx_split %>%
-    mutate(norm = word_norms[response]) %>%
-    group_by(participant_id, prompt) %>%
-    summarise(
-      !!paste0(prefix, "_norm_mean") := mean(norm, na.rm = TRUE),
-      !!paste0(prefix, "_norm_sd") := sd(norm, na.rm = TRUE),
+    dplyr::left_join(norms_df, by = "response") %>%
+    dplyr::group_by(participant_id, prompt) %>%
+    dplyr::summarise(
+      !!paste0(prefix, "_l1_norm_mean") :=
+        mean(l1_norm, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_sd") :=
+        sd(l1_norm, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_mean") :=
+        mean(l2_norm, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_sd") :=
+        sd(l2_norm, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l1_norm_origin_avg_all_mean") :=
+        mean(l1_norm_origin_avg_all, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_origin_avg_all_sd") :=
+        sd(l1_norm_origin_avg_all, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_origin_avg_all_mean") :=
+        mean(l2_norm_origin_avg_all, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_origin_avg_all_sd") :=
+        sd(l2_norm_origin_avg_all, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l1_norm_origin_avg_set_mean") :=
+        mean(l1_norm_origin_avg_set, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_origin_avg_set_sd") :=
+        sd(l1_norm_origin_avg_set, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_origin_avg_set_mean") :=
+        mean(l2_norm_origin_avg_set, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_origin_avg_set_sd") :=
+        sd(l2_norm_origin_avg_set, na.rm = TRUE),
+      
       .groups = "drop"
     )
   
-  # Per participant norms
+  # --- Per-participant summaries (same stats collapsed over prompts) ---
+  
   per_participant_norms <- tx_split %>%
-    mutate(norm = word_norms[response]) %>%
-    group_by(participant_id) %>%
-    summarise(
-      !!paste0(prefix, "_norm_mean") := mean(norm, na.rm = TRUE),
-      !!paste0(prefix, "_norm_sd") := sd(norm, na.rm = TRUE),
+    dplyr::left_join(norms_df, by = "response") %>%
+    dplyr::group_by(participant_id) %>%
+    dplyr::summarise(
+      !!paste0(prefix, "_l1_norm_mean") :=
+        mean(l1_norm, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_sd") :=
+        sd(l1_norm, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_mean") :=
+        mean(l2_norm, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_sd") :=
+        sd(l2_norm, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l1_norm_origin_avg_all_mean") :=
+        mean(l1_norm_origin_avg_all, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_origin_avg_all_sd") :=
+        sd(l1_norm_origin_avg_all, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_origin_avg_all_mean") :=
+        mean(l2_norm_origin_avg_all, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_origin_avg_all_sd") :=
+        sd(l2_norm_origin_avg_all, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l1_norm_origin_avg_set_mean") :=
+        mean(l1_norm_origin_avg_set, na.rm = TRUE),
+      !!paste0(prefix, "_l1_norm_origin_avg_set_sd") :=
+        sd(l1_norm_origin_avg_set, na.rm = TRUE),
+      
+      !!paste0(prefix, "_l2_norm_origin_avg_set_mean") :=
+        mean(l2_norm_origin_avg_set, na.rm = TRUE),
+      !!paste0(prefix, "_l2_norm_origin_avg_set_sd") :=
+        sd(l2_norm_origin_avg_set, na.rm = TRUE),
+      
       .groups = "drop"
     )
   
@@ -1246,6 +1368,94 @@ cosine_similarity <- function(vec1, vec2) {
   if (norm1 == 0 || norm2 == 0) return(0)
   
   return(dot_product / (norm1 * norm2))
+}
+
+
+################################################################################
+# Calculate similarity to semantic anchor sets (config-driven)
+################################################################################
+
+calculate_anchor_set_similarity <- function(tx_split, emb_matrix, prefix = "sem", config) {
+  # Expect anchors under config$semantic$anchor_sets
+  if (is.null(config$features$spatial_anchors)) {
+    return(NULL)
+  }
+  
+  anchor_sets <- config$features$spatial_anchors
+  
+  # Convert to long tibble: anchor_category, text
+  anchors_meta <- purrr::imap_dfr(anchor_sets, function(words, name) {
+    tibble::tibble(
+      anchor_category = name,
+      text = tolower(unlist(words))
+    )
+  })
+  
+  # Keep only anchors present in the embedding matrix
+  anchors_meta <- anchors_meta %>%
+    dplyr::filter(text %in% rownames(emb_matrix))
+  
+  if (nrow(anchors_meta) == 0) {
+    return(NULL)
+  }
+  
+  # Responses that have embeddings
+  valid_responses <- unique(tx_split$response)
+  valid_responses <- valid_responses[valid_responses %in% rownames(emb_matrix)]
+  
+  if (length(valid_responses) == 0) {
+    return(NULL)
+  }
+  
+  # All anchor–response pairs
+  pairs <- expand.grid(
+    w1 = anchors_meta$text,
+    w2 = valid_responses,
+    stringsAsFactors = FALSE
+  )
+  
+  pairs$cosine_similarity <- vapply(
+    seq_len(nrow(pairs)),
+    function(i) {
+      w1 <- pairs$w1[i]
+      w2 <- pairs$w2[i]
+      cosine_similarity(
+        as.numeric(emb_matrix[w1, ]),
+        as.numeric(emb_matrix[w2, ])
+      )
+    },
+    numeric(1)
+  )
+  
+  # Join to trial-level data
+  anchor_sim <- tx_split %>%
+    dplyr::filter(response %in% valid_responses) %>%
+    dplyr::select(participant_id, prompt, response) %>%
+    dplyr::left_join(
+      pairs %>% dplyr::rename(response = w2, text=w1)
+    ) %>%
+    dplyr::left_join(
+      anchors_meta,
+      by = dplyr::join_by(text),
+      relationship = "many-to-many"
+    )
+  
+  # Aggregate: max similarity per participant × prompt × category
+  per_prompt <- anchor_sim %>%
+    dplyr::group_by(participant_id, prompt, anchor_category) %>%
+    dplyr::summarise(
+      val = max(cosine_similarity, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      anchor_category = paste0(prefix, "_", anchor_category, "_similarity")
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = anchor_category,
+      values_from = val
+    )
+  
+  return(per_prompt)
 }
 
 ################################################################################

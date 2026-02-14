@@ -1,0 +1,22 @@
+name: Docker Build Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: docker build -t psvc-pipeline:test .
+    
+    - name: Test import
+      run: |
+        docker run --rm psvc-pipeline:test \
+          /opt/conda/bin/conda run -n whisperx_env python -c "import whisperx"
